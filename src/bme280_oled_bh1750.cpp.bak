@@ -1,0 +1,368 @@
+/**
+ * Weather Station - Ported from CircuitPython to Arduino
+ *
+ * Hardware components:
+ * - ESP32 board
+ * - BME280 temperature/humidity/pressure sensor
+ * - BH1750 light sensor
+ * - SSD1306 OLED display (128x64)
+ * - Button on pin D45
+ * - WS2812 NeoPixel LED
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_BME280.h>
+#include <Adafruit_SSD1306.h>
+#include <BH1750.h>
+#include <Adafruit_NeoPixel.h>
+
+void readSensors();
+void updateDisplay();
+void printSensorValues();
+
+// Pin definitions
+#define I2C_SDA 17
+#define I2C_SCL 16
+#define BUTTON_PIN 45
+#define NEOPIXEL_PIN 48 // Adjust according to your ESP32 board's NeoPixel pin
+
+// Constants
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define NEOPIXEL_COUNT 1
+#define SENSOR_UPDATE_INTERVAL 500 // 0.5 seconds in milliseconds
+#define COLOR_UPDATE_INTERVAL 50    // 50ms for smooth color transition
+
+// Global objects
+Adafruit_BME280 bme;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+BH1750 lightSensor;
+Adafruit_NeoPixel pixel(NEOPIXEL_COUNT, NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+// Global variables
+bool pixelState = true;          // Start with pixel on
+float hue = 0;                   // Starting hue value for rainbow effect
+bool previousButtonState = HIGH; // Assuming not pressed initially (pull-up)
+
+// Timing variables
+unsigned long lastSensorUpdate = 0;
+unsigned long lastColorUpdate = 0;
+
+// Sensor readings
+float temperature, humidity, pressure, altitude, lightLevel;
+
+// Function to convert HSV to RGB
+void hsvToRgb(float h, float s, float v, int &r, int &g, int &b)
+{
+  h = h * 6;
+  int i = int(h);
+  float f = h - i;
+  float p = v * (1 - s);
+  float q = v * (1 - f * s);
+  float t = v * (1 - (1 - f) * s);
+
+  switch (i)
+  {
+  case 0:
+    r = v * 255;
+    g = t * 255;
+    b = p * 255;
+    break;
+  case 1:
+    r = q * 255;
+    g = v * 255;
+    b = p * 255;
+    break;
+  case 2:
+    r = p * 255;
+    g = v * 255;
+    b = t * 255;
+    break;
+  case 3:
+    r = p * 255;
+    g = q * 255;
+    b = v * 255;
+    break;
+  case 4:
+    r = t * 255;
+    g = p * 255;
+    b = v * 255;
+    break;
+  default: // case 5
+    r = v * 255;
+    g = p * 255;
+    b = q * 255;
+    break;
+  }
+}
+
+void setup()
+{
+  // Initialize serial communication
+  Serial.begin(115200);
+  Serial.println("\nWeather Station Starting...");
+
+  // Initialize I2C
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  // Set up button with internal pull-up
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+  // Initialize BME280 sensor
+  if (!bme.begin(0x76))
+  {
+    Serial.println("Could not find BME280 sensor!");
+    while (1)
+      delay(10);
+  }
+
+  // Initialize light sensor
+  if (!lightSensor.begin())
+  {
+    Serial.println("Could not find BH1750 light sensor!");
+    while (1)
+      delay(10);
+  }
+
+  // Initialize OLED display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
+  {
+    Serial.println("SSD1306 allocation failed");
+    while (1)
+      delay(10);
+  }
+  display.clearDisplay();
+  display.display();
+
+  // Initialize NeoPixel
+  pixel.begin();
+  pixel.setBrightness(76); // ~30% of 255
+  pixel.show();
+
+  // Set BME280 sea level pressure for altitude calculation
+  bme.setSampling(Adafruit_BME280::MODE_NORMAL,
+                  Adafruit_BME280::SAMPLING_X16, // temperature
+                  Adafruit_BME280::SAMPLING_X16, // pressure
+                  Adafruit_BME280::SAMPLING_X16, // humidity
+                  Adafruit_BME280::FILTER_X16,
+                  Adafruit_BME280::STANDBY_MS_500);
+
+  // Initial sensor readings
+  readSensors();
+  updateDisplay();
+
+  Serial.println("Setup complete!");
+}
+
+void loop()
+{
+  unsigned long currentTime = millis();
+
+  // Check button state for controlling NeoPixel
+  bool currentButtonState = digitalRead(BUTTON_PIN);
+
+  // Button is pressed when it goes from high to low (due to pull-up)
+  if (currentButtonState == LOW && previousButtonState == HIGH)
+  {
+    // Toggle pixel state
+    pixelState = !pixelState;
+    if (!pixelState)
+    {
+      // Turn off NeoPixel
+      pixel.setPixelColor(0, 0, 0, 0);
+      pixel.show();
+    }
+    // Small delay to avoid button bounce
+    delay(50);
+  }
+
+  // Update previous button state
+  previousButtonState = currentButtonState;
+
+  // Update NeoPixel color if it's on
+  if (pixelState && (currentTime - lastColorUpdate >= COLOR_UPDATE_INTERVAL))
+  {
+    // Update rainbow effect
+    hue = fmod(hue + 0.01, 1.0);
+    // Convert HSV to RGB (full saturation and value)
+    int r, g, b;
+    hsvToRgb(hue, 1.0, 1.0, r, g, b);
+    // Set the pixel color
+    pixel.setPixelColor(0, r, g, b);
+    pixel.show();
+    // Update the last color update time
+    lastColorUpdate = currentTime;
+  }
+
+  // Update sensor readings and display
+  if (currentTime - lastSensorUpdate >= SENSOR_UPDATE_INTERVAL)
+  {
+    readSensors();
+    printSensorValues();
+    updateDisplay();
+
+    // Adjust NeoPixel brightness based on ambient light (optional)
+    if (pixelState)
+    {
+      // Map light level to brightness (0.05-0.5 range)
+      // Brighter in dark environments, dimmer in bright environments
+      float brightness = max(0.05, min(0.5, 0.5 - (lightLevel / 2000) * 0.45));
+      pixel.setBrightness(int(brightness * 255));
+    }
+
+    // Update the last sensor update time
+    lastSensorUpdate = currentTime;
+  }
+
+  // Small delay to prevent tight loop
+  delay(10);
+}
+
+void readSensors()
+{
+  try
+  {
+    // Read values from BME280
+    temperature = bme.readTemperature();
+    humidity = bme.readHumidity();
+    pressure = bme.readPressure() / 100.0F; // Convert Pa to hPa
+    altitude = bme.readAltitude(1010.0);
+
+    // Read light level from BH1750
+    lightLevel = lightSensor.readLightLevel();
+  }
+  catch (...)
+  {
+    Serial.println("Error reading sensors");
+  }
+}
+
+void printSensorValues()
+{
+  Serial.println("\nCurrent sensor readings:");
+  Serial.print("Temperature: ");
+  Serial.print(temperature, 1);
+  Serial.println(" C");
+  Serial.print("Humidity: ");
+  Serial.print(humidity, 1);
+  Serial.println(" %");
+  Serial.print("Pressure: ");
+  Serial.print(pressure, 1);
+  Serial.println(" hPa");
+  Serial.print("Altitude: ");
+  Serial.print(altitude, 2);
+  Serial.println(" meters");
+  Serial.print("Light Level: ");
+  Serial.print(lightLevel, 1);
+  Serial.println(" lux");
+}
+
+void updateDisplay()
+{
+  try
+  {
+    // Clear the display
+    display.clearDisplay();
+
+    // Draw header with border
+    display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+    display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+    display.setCursor(6, 2);
+    display.print("WEATHER STATION");
+
+    // Switch to white text on black background
+    display.setTextColor(SSD1306_WHITE);
+
+    // Draw separator lines
+    display.drawFastHLine(0, 14, 128, SSD1306_WHITE);
+    display.drawFastHLine(0, 27, 128, SSD1306_WHITE); // Separator between first and second row
+    display.drawFastHLine(0, 40, 128, SSD1306_WHITE); // Separator between second and third row
+    display.drawRect(0, 0, 128, 64, SSD1306_WHITE);   // Border around the display
+
+    // Row 1: Temperature and Humidity
+    display.setCursor(5, 18);
+    display.print("T:");
+    display.setCursor(70, 18);
+    display.print("H:");
+
+    // Row 2: Pressure and Altitude
+    display.setCursor(5, 31);
+    display.print("P:");
+    display.setCursor(70, 31);
+    display.print("A:");
+
+    // Row 3: Light level and category
+    display.setCursor(5, 44);
+    display.print("L:");
+
+    // Format the text for display
+    // Temperature and humidity
+    display.setCursor(20, 18);
+    display.print(temperature, 1);
+    display.print("C");
+
+    display.setCursor(85, 18);
+    display.print(humidity, 1);
+    display.print("%");
+
+    // Pressure and altitude
+    display.setCursor(20, 31);
+    display.print(int(pressure));
+    display.print("hPa");
+
+    display.setCursor(85, 31);
+    display.print(int(altitude));
+    display.print("m");
+
+    // Light level
+    display.setCursor(20, 44);
+    display.print(lightLevel, 1);
+    display.print("lux");
+
+    // Light category
+    String category = "";
+    if (lightLevel < 10)
+    {
+      category = "DARK";
+    }
+    else if (lightLevel < 200)
+    {
+      category = "DIM";
+    }
+    else if (lightLevel < 1000)
+    {
+      category = "NORMAL";
+    }
+    else
+    {
+      category = "BRIGHT";
+    }
+
+    display.setCursor(70, 44);
+    display.print(category);
+
+    // Draw scale markers
+    display.setCursor(5, 54);
+    display.print("0");
+    display.setCursor(113, 54);
+    display.print("1K");
+
+    // Draw empty bar outline
+    display.drawRect(15, 54, 95, 6, SSD1306_WHITE);
+
+    // Fill bar based on light level (max 1000 lux for full bar)
+    int barWidth = min(int((lightLevel / 1000) * 93), 93); // Ensure it fits inside outline
+    if (barWidth > 0)
+    { // Only draw if there's something to show
+      display.fillRect(16, 55, barWidth, 4, SSD1306_WHITE);
+    }
+
+    // Show the display
+    display.display();
+  }
+  catch (...)
+  {
+    Serial.println("Error updating display");
+  }
+}
