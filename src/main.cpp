@@ -5,6 +5,7 @@
  * - ESP32-S3 board
  * - BME280 temperature/humidity/pressure sensor
  * - BH1750 light sensor
+ * - QMC5883L magnetometer
  * - SSD1306 OLED display (128x64)
  */
 
@@ -14,6 +15,7 @@
 #include <Adafruit_BME280.h>
 #include <Adafruit_SSD1306.h>
 #include <BH1750.h>
+#include <QMC5883LCompass.h>
 #include <AsyncMqttClient.h>
 
 // Function declarations
@@ -43,6 +45,10 @@ constexpr const char *MQTT_PUB_HUM = "esp/bme280/humidity";
 constexpr const char *MQTT_PUB_PRES = "esp/bme280/pressure";
 constexpr const char *MQTT_PUB_ALT = "esp/bme280/altitude";
 constexpr const char *MQTT_PUB_LIG = "esp/bh1750/light";
+constexpr const char *MQTT_PUB_MAG_X = "esp/qmc5883l/x";
+constexpr const char *MQTT_PUB_MAG_Y = "esp/qmc5883l/y";
+constexpr const char *MQTT_PUB_MAG_Z = "esp/qmc5883l/z";
+constexpr const char *MQTT_PUB_HEADING = "esp/qmc5883l/heading";
 
 // Pin definitions
 constexpr uint8_t I2C_SDA = 17;
@@ -58,6 +64,7 @@ constexpr float SEA_LEVEL_PRESSURE_HPA = 1010.0f;     // Sylhet sea level pressu
 Adafruit_BME280 bme;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 BH1750 lightSensor;
+QMC5883LCompass compass; // Changed to QMC5883L compass object
 AsyncMqttClient mqttClient;
 
 // Timer handlers for reconnection
@@ -69,6 +76,9 @@ unsigned long lastSensorUpdate = 0;
 
 // Sensor readings
 float temperature, humidity, pressure, altitude, lightLevel;
+// Magnetometer readings
+int magX, magY, magZ; // QMC5883L library uses int values
+float heading;
 
 void setup()
 {
@@ -108,6 +118,12 @@ void setup()
     while (1)
       delay(10);
   }
+
+  // Initialize QMC5883L magnetometer
+  compass.init();
+  // Optional settings for QMC5883L
+  compass.setCalibration(-1361, 1307, -1430, 1383, -1117, 1301);
+  compass.setSmoothing(10, true); // Set smoothing to 10 readings with weighted smooth
 
   // Initialize OLED display
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
@@ -175,6 +191,23 @@ void loop()
       uint16_t packetIdPub5 = mqttClient.publish(MQTT_PUB_ALT, 1, true, String(altitude).c_str());
       Serial.printf("Publishing on topic %s at QoS 1, packetId %i: ", MQTT_PUB_ALT, packetIdPub5);
       Serial.printf("Message: %.2f \n", altitude);
+
+      // Publish magnetometer data
+      uint16_t packetIdPub6 = mqttClient.publish(MQTT_PUB_MAG_X, 1, true, String(magX).c_str());
+      Serial.printf("Publishing on topic %s at QoS 1, packetId %i: ", MQTT_PUB_MAG_X, packetIdPub6);
+      Serial.printf("Message: %d \n", magX);
+
+      uint16_t packetIdPub7 = mqttClient.publish(MQTT_PUB_MAG_Y, 1, true, String(magY).c_str());
+      Serial.printf("Publishing on topic %s at QoS 1, packetId %i: ", MQTT_PUB_MAG_Y, packetIdPub7);
+      Serial.printf("Message: %d \n", magY);
+
+      uint16_t packetIdPub8 = mqttClient.publish(MQTT_PUB_MAG_Z, 1, true, String(magZ).c_str());
+      Serial.printf("Publishing on topic %s at QoS 1, packetId %i: ", MQTT_PUB_MAG_Z, packetIdPub8);
+      Serial.printf("Message: %d \n", magZ);
+
+      uint16_t packetIdPub9 = mqttClient.publish(MQTT_PUB_HEADING, 1, true, String(heading).c_str());
+      Serial.printf("Publishing on topic %s at QoS 1, packetId %i: ", MQTT_PUB_HEADING, packetIdPub9);
+      Serial.printf("Message: %.2f \n", heading);
     }
     else
     {
@@ -256,6 +289,20 @@ void readSensors()
 
     // Read light level from BH1750
     lightLevel = lightSensor.readLightLevel();
+
+    // Read magnetometer values from QMC5883L
+    compass.read(); // Read the compass values
+
+    // Get raw magnetometer values
+    magX = compass.getX();
+    magY = compass.getY();
+    magZ = compass.getZ();
+
+    // Get heading in degrees (0-360)
+    heading = compass.getAzimuth();
+
+    // Optional: Get cardinal direction as text
+    // const char* direction = compass.getDirection();
   }
   catch (...)
   {
@@ -281,6 +328,17 @@ void printSensorValues()
   Serial.print("Light Level: ");
   Serial.print(lightLevel, 1);
   Serial.println(" lux");
+
+  // Print magnetometer values
+  Serial.print("Magnetometer X: ");
+  Serial.println(magX);
+  Serial.print("Magnetometer Y: ");
+  Serial.println(magY);
+  Serial.print("Magnetometer Z: ");
+  Serial.println(magZ);
+  Serial.print("Heading: ");
+  Serial.print(heading);
+  Serial.println(" degrees");
 }
 
 void updateDisplay()
@@ -317,9 +375,12 @@ void updateDisplay()
     display.setCursor(70, 31);
     display.print("A:");
 
-    // Row 3: Light level and category
+    // Row 3: Light level and compass direction
     display.setCursor(5, 44);
     display.print("L:");
+
+    display.setCursor(70, 44);
+    display.print("C:");
 
     // Format the text for display
     // Temperature and humidity
@@ -345,27 +406,10 @@ void updateDisplay()
     display.print(lightLevel, 1);
     display.print("lux");
 
-    // Light category
-    String category = "";
-    if (lightLevel < 10)
-    {
-      category = "DARK";
-    }
-    else if (lightLevel < 200)
-    {
-      category = "DIM";
-    }
-    else if (lightLevel < 1000)
-    {
-      category = "NORMAL";
-    }
-    else
-    {
-      category = "BRIGHT";
-    }
-
-    display.setCursor(70, 44);
-    display.print(category);
+    // Compass heading
+    display.setCursor(85, 44);
+    display.print(int(heading));
+    display.print("°");
 
     // Draw scale markers
     display.setCursor(5, 54);
